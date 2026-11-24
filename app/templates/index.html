@@ -74,6 +74,33 @@
     <h2>3. 核查结论</h2>
     <div id="resultBox"><p class="muted">尚未核查。</p></div>
   </section>
+
+  <section class="card">
+    <h2>4. 漏导核算（选两条已核实锚点界定选段）</h2>
+    <p class="muted" style="margin-top:0">
+      选段时间跨度至多 30 分钟、段内已导事件至多 200 条；段内全部锚点视为准确。
+      核算只读当前已提交状态，期间仍可补登锚点、更正或换账；登记结果前若已换账或
+      段内锚点有出入会要求重算（段外变更可照常登记）。
+    </p>
+    <div class="row">
+      <label>左端事件号 <input type="number" id="missLeft" min="1"></label>
+      <label>右端事件号 <input type="number" id="missRight" min="1"></label>
+      <button class="primary" id="missComputeBtn">核算最少漏导</button>
+      <span id="missBanner" class="muted"></span>
+    </div>
+    <div id="missResult"></div>
+  </section>
+
+  <section class="card">
+    <h2>5. 漏导核算记录（换账后仍可凭编号回查）</h2>
+    <div class="row">
+      <button id="missRefreshBtn">刷新记录</button>
+      <label>按编号回查 <input type="number" id="missLookupId" min="1" style="width:110px"></label>
+      <button id="missLookupBtn">回查</button>
+    </div>
+    <div id="missRecords"></div>
+    <div id="missDetail"></div>
+  </section>
 </main>
 
 <script>
@@ -218,6 +245,148 @@ $("verifyBtn").addEventListener("click", async () => {
     clearBanner();
   } catch (e) { banner("bad", e.message); }
 });
+
+// ---------------- 漏导核算 ----------------
+let lastMissingResult = null;
+
+function missNote(text, kind) {
+  const el = $("missBanner");
+  el.textContent = text;
+  el.style.color = kind === "bad" ? "var(--bad)" : kind === "ok" ? "var(--ok)" : "";
+}
+
+function renderMissing(result) {
+  const box = $("missResult");
+  const sel = result.selection;
+  let html = `<p style="margin-bottom:8px">选段：事件 <b>${sel.left_event} → ${sel.right_event}</b>，` +
+    `已导事件 ${sel.imported_event_count} 条，跨度 ${sel.span_ms} ms，段内锚点 ${sel.anchor_count} 条。</p>`;
+
+  if (result.status === "impossible") {
+    html += `<p><span class="tag bad">对不上</span> ${result.message}</p>`;
+    result.subsegments.forEach(s => {
+      if (!s.ok) {
+        html += `<div class="cand">锚点对 事件 ${s.left_event} → ${s.right_event}：` +
+          `时差 ${s.elapsed_ms} ms，计数可达最小耗时 ${s.base_ms} ms；${s.hint}</div>`;
+      }
+    });
+    box.innerHTML = html;
+    return;
+  }
+
+  html += `<p><span class="tag ok">可解释</span> ${result.message}</p>`;
+  result.subsegments.forEach((s, si) => {
+    html += `<div class="cand"><div>子段 ${si + 1}：锚点 事件 ${s.left_event} → ${s.right_event}，` +
+      `耗时 ${s.elapsed_ms} ms，该子段最少漏导 <b>${s.missing}</b> 条，额外回绕 ${s.extra_turns} 圈。</div>` +
+      `<table style="margin-top:8px"><thead><tr><th class="l">间隔（事件号）</th><th>模差 r</th>` +
+      `<th>最小候选(ms)</th><th>额外圈</th><th>实际耗时(ms)</th><th>漏导条数</th><th class="l">类型</th></tr></thead><tbody>`;
+    s.intervals.forEach(it => {
+      html += `<tr><td class="l">${it.left_event} → ${it.right_event}</td>` +
+        `<td>${it.residue}</td><td>${it.base_ms}</td><td>${it.extra_turn}</td>` +
+        `<td>${it.elapsed_ms}</td><td><b>${it.missing}</b></td>` +
+        `<td class="l">${it.ambiguous ? "模糊" : "固定"}</td></tr>`;
+    });
+    html += "</tbody></table></div>";
+  });
+  html += `<div class="row" style="margin-top:10px">` +
+    `<button class="primary" id="missSaveBtn">登记这组核算结果（编号回查）</button></div>`;
+  box.innerHTML = html;
+
+  $("missSaveBtn").addEventListener("click", async () => {
+    try {
+      const data = await api("/api/missing/records", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ result: lastMissingResult })
+      });
+      missNote(`已登记为 #${data.record.id}`, "ok");
+      loadMissingRecords();
+    } catch (e) { missNote(e.message, "bad"); }
+  });
+}
+
+function renderMissingRecords(records) {
+  const box = $("missRecords");
+  if (!records.length) {
+    box.innerHTML = '<p class="muted" style="margin-bottom:0">暂无登记记录。</p>';
+    return;
+  }
+  let html = '<table style="margin-top:10px"><thead><tr><th class="l">编号</th>' +
+    '<th class="l">状态</th><th>选段</th><th>跨度(ms)</th><th>已导</th>' +
+    '<th>最少漏导</th><th>账版本</th><th class="l">登记时间</th><th class="l">时效</th></tr></thead><tbody>';
+  records.forEach(r => {
+    const stale = r.freshness.freshness !== "current";
+    html += `<tr><td class="l"><a href="#" data-lookup="${r.id}">#${r.id}</a></td>` +
+      `<td class="l">${r.status === "feasible" ? '<span class="tag ok">可解释</span>' : '<span class="tag bad">对不上</span>'}</td>` +
+      `<td>${r.left_event} → ${r.right_event}</td><td>${r.span_ms}</td>` +
+      `<td>${r.imported_event_count}</td>` +
+      `<td>${r.total_missing === null ? "—" : r.total_missing}</td>` +
+      `<td>${r.dataset_version}</td><td class="l">${r.created_at}</td>` +
+      `<td class="l">${stale ? '<span class="tag warn">需重算</span>' : '<span class="tag ok">现行有效</span>'}</td></tr>`;
+  });
+  html += "</tbody></table>";
+  box.innerHTML = html;
+  box.querySelectorAll("a[data-lookup]").forEach(a =>
+    a.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      await showMissingDetail(a.dataset.lookup);
+    }));
+}
+
+async function showMissingDetail(id) {
+  try {
+    const data = await api(`/api/missing/records/${id}`);
+    const r = data.record;
+    const stale = r.freshness.freshness !== "current";
+    let html = `<div class="cand"><div>记录 <b>#${r.id}</b>（账版本 ${r.dataset_version}，文件 ${r.filename}）：` +
+      `事件 ${r.left_event} → ${r.right_event}，状态 ${r.status}，` +
+      `最少漏导 ${r.total_missing === null ? "—" : r.total_missing} 条。</div>` +
+      `<div class="muted" style="margin:6px 0">所用锚点快照：` +
+      r.anchor_snapshot.map(a => `事件${a.event_no}@${a.utc_ms}`).join("；") + "</div>" +
+      `<div>${stale ? '<span class="tag warn">需重算</span> ' + r.freshness.reasons.join("；")
+                      : '<span class="tag ok">现行有效</span> 段内锚点与当前一致'}</div>`;
+    if (r.result && r.result.status === "feasible") {
+      html += '<table style="margin-top:8px"><thead><tr><th class="l">间隔（事件号）</th>' +
+        '<th>实际耗时(ms)</th><th>漏导条数</th><th>额外圈</th></tr></thead><tbody>';
+      r.result.subsegments.forEach(s => s.intervals.forEach(it => {
+        html += `<tr><td class="l">${it.left_event} → ${it.right_event}</td>` +
+          `<td>${it.elapsed_ms}</td><td><b>${it.missing}</b></td><td>${it.extra_turn}</td></tr>`;
+      }));
+      html += "</tbody></table>";
+    }
+    html += '<div class="muted" style="margin-top:6px">段外锚点变更不影响时效。</div></div>';
+    $("missDetail").innerHTML = html;
+  } catch (e) { missNote(e.message, "bad"); }
+}
+
+async function loadMissingRecords() {
+  try {
+    const data = await api("/api/missing/records");
+    renderMissingRecords(data.records || []);
+  } catch (e) { missNote(e.message, "bad"); }
+}
+
+$("missComputeBtn").addEventListener("click", async () => {
+  const left_event = parseInt($("missLeft").value, 10);
+  const right_event = parseInt($("missRight").value, 10);
+  try {
+    const data = await api("/api/missing/compute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ left_event, right_event })
+    });
+    lastMissingResult = data.result;
+    renderMissing(data.result);
+    missNote("核算完成（只读，未改动当前账）", "ok");
+  } catch (e) { missNote(e.message, "bad"); }
+});
+
+$("missRefreshBtn").addEventListener("click", loadMissingRecords);
+$("missLookupBtn").addEventListener("click", async () => {
+  const id = parseInt($("missLookupId").value, 10);
+  if (Number.isInteger(id)) await showMissingDetail(id);
+});
+
+loadMissingRecords();
 
 refresh();
 </script>
