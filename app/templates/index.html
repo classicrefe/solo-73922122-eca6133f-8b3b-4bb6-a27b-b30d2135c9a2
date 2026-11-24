@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>振动记录仪时刻核查</title>
+  <style>
+    :root { --ok:#1a7f37; --bad:#c0392b; --warn:#b26a00; --line:#d0d7de; }
+    * { box-sizing: border-box; }
+    body { font-family: "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif;
+           margin:0; background:#f6f8fa; color:#1f2328; }
+    header { background:#0f2f4d; color:#fff; padding:16px 24px; }
+    header h1 { margin:0 0 4px; font-size:20px; }
+    header p { margin:0; font-size:13px; opacity:.85; }
+    main { max-width:1080px; margin:20px auto; padding:0 16px; display:grid; gap:16px; }
+    .card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px 18px; }
+    .card h2 { margin:0 0 12px; font-size:16px; }
+    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+    button { border:1px solid var(--line); background:#f6f8fa; border-radius:6px;
+             padding:7px 14px; cursor:pointer; font-size:14px; }
+    button.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    input { padding:7px 9px; border:1px solid var(--line); border-radius:6px; font-size:14px; width:130px; }
+    table { border-collapse:collapse; width:100%; font-size:13px; }
+    th, td { border:1px solid var(--line); padding:6px 9px; text-align:right; }
+    th { background:#f0f3f6; }
+    td.l, th.l { text-align:left; }
+    .tag { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; }
+    .tag.ok { background:#dafbe1; color:var(--ok); }
+    .tag.bad { background:#ffebe9; color:var(--bad); }
+    .tag.warn { background:#fff8c5; color:var(--warn); }
+    #banner { margin:0 0 10px; padding:10px 12px; border-radius:6px; font-size:14px; display:none; }
+    #banner.show { display:block; }
+    #banner.ok { background:#dafbe1; color:var(--ok); }
+    #banner.bad { background:#ffebe9; color:var(--bad); }
+    #banner.warn { background:#fff8c5; color:var(--warn); }
+    .muted { color:#656d76; font-size:12px; }
+    .cand { border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-top:8px; background:#fafbfc; }
+    .cand button { margin-top:8px; }
+    code { background:#eff1f3; padding:1px 5px; border-radius:4px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>桥梁振动记录仪 · 纸本 UTC 时刻核查</h1>
+  <p>计数每毫秒 +1，满 65536 归零；相邻事件间隔 1～90000 ms。锚点至少 {{ min_anchors }} 条（事件号 + 纸本 UTC 毫秒）。</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 上传事件 CSV（列：事件号、计数；按事件顺序排列）</h2>
+    <div class="row">
+      <input type="file" id="csvFile" accept=".csv,text/csv" style="width:auto">
+      <button class="primary" id="uploadBtn">上传并建账</button>
+      <span id="datasetInfo" class="muted"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2. 锚点登记（核查期间可随时补登记）</h2>
+    <div class="row">
+      <label>事件号 <input type="number" id="anchorEvent" min="1"></label>
+      <label>纸本 UTC 毫秒 <input type="number" id="anchorUtc" min="0"></label>
+      <button id="addAnchorBtn">登记锚点</button>
+      <button class="primary" id="verifyBtn">按全部锚点核查</button>
+    </div>
+    <div id="banner"></div>
+    <table id="anchorTable" style="margin-top:10px">
+      <thead><tr><th class="l">锚点ID</th><th>事件号</th><th>纸本 UTC 毫秒</th><th class="l">登记时间</th><th class="l">操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>3. 核查结论</h2>
+    <div id="resultBox"><p class="muted">尚未核查。</p></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function banner(kind, text) {
+  const el = $("banner");
+  el.className = "show " + kind;
+  el.textContent = text;
+}
+function clearBanner() { $("banner").className = ""; }
+
+async function api(url, opts) {
+  const resp = await fetch(url, opts);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.ok === false) throw new Error(data.error || ("HTTP " + resp.status));
+  return data;
+}
+
+function renderAnchors(anchors) {
+  const tb = document.querySelector("#anchorTable tbody");
+  tb.innerHTML = "";
+  anchors.forEach(a => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="l">${a.id}</td><td>${a.event_no}</td>` +
+      `<td>${a.utc_ms}</td><td class="l">${a.created_at}</td>` +
+      `<td class="l"><button data-del="${a.id}">删除</button></td>`;
+    tb.appendChild(tr);
+  });
+  tb.querySelectorAll("button[data-del]").forEach(btn =>
+    btn.addEventListener("click", async () => {
+      try {
+        const data = await api(`/api/anchors/${btn.dataset.del}`, { method: "DELETE" });
+        renderAnchors(data.anchors);
+      } catch (e) { banner("bad", e.message); }
+    }));
+}
+
+function renderResult(result) {
+  const box = $("resultBox");
+  if (result.status === "insufficient") {
+    box.innerHTML = `<p><span class="tag warn">锚点不足</span> ${result.message}</p>`;
+    return;
+  }
+  let html = '<table><thead><tr><th class="l">锚点对</th><th>纸本时差(ms)</th>' +
+    '<th>可达首值</th><th>可达末值</th><th>步长</th><th class="l">结论</th></tr></thead><tbody>';
+  result.pairs.forEach(p => {
+    html += `<tr><td class="l">事件 ${p.left_event} → ${p.right_event}</td>` +
+      `<td>${p.delta}</td><td>${p.low}</td><td>${p.high}</td><td>${p.step}</td>` +
+      `<td class="l">${p.ok ? '<span class="tag ok">对得上</span>' : '<span class="tag bad">对不上</span>'}</td></tr>`;
+  });
+  html += "</tbody></table>";
+
+  if (result.status === "consistent") {
+    html += `<p style="margin-top:12px"><span class="tag ok">一致</span> ${result.message}</p>`;
+  } else {
+    html += `<p style="margin-top:12px"><span class="tag bad">不一致</span> ${result.message}</p>`;
+    if (result.candidates.length === 0) {
+      html += '<p class="muted">单处更正无法对平，请人工复核两处以上锚点。</p>';
+    } else {
+      result.candidates.forEach(c => {
+        html += `<div class="cand">
+          <div>可只改锚点 <b>#${c.anchor_id}</b>（事件 ${c.event_no}，原时刻
+          <code>${c.original_utc_ms}</code>）即可对平全账。</div>
+          <div>可替换时刻：首值 <code>${c.first}</code>，末值 <code>${c.last}</code>，
+          步长 <code>${c.step}</code>，共 ${c.count} 个候选。</div>
+          <div class="row" style="margin-top:6px">
+            <label>确认改为 <input type="number" min="0" id="fix_${c.anchor_id}"
+              value="${c.first}" style="width:180px"> ms</label>
+            <button class="primary" data-fix='${JSON.stringify(c)}'>确认更正并复核</button>
+          </div></div>`;
+      });
+    }
+  }
+  box.innerHTML = html;
+
+  box.querySelectorAll("button[data-fix]").forEach(btn =>
+    btn.addEventListener("click", async () => {
+      const c = JSON.parse(btn.dataset.fix);
+      const val = parseInt($("fix_" + c.anchor_id).value, 10);
+      try {
+        const data = await api("/api/correct", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ anchor_id: c.anchor_id, new_utc_ms: val })
+        });
+        renderAnchors(data.anchors);
+        renderResult(data.result);
+        banner("ok", data.message);
+      } catch (e) {
+        banner("bad", e.message);
+        await refresh();
+      }
+    }));
+}
+
+async function refresh() {
+  try {
+    const data = await api("/api/state");
+    if (data.dataset) {
+      $("datasetInfo").textContent =
+        `当前账：${data.dataset.filename}，事件 ${data.dataset.event_count} 条，建账 ${data.dataset.created_at}`;
+    } else {
+      $("datasetInfo").textContent = "尚未建账";
+    }
+    renderAnchors(data.anchors || []);
+  } catch (e) { banner("bad", e.message); }
+}
+
+$("uploadBtn").addEventListener("click", async () => {
+  const f = $("csvFile").files[0];
+  if (!f) return banner("bad", "请先选择 CSV 文件");
+  const fd = new FormData();
+  fd.append("file", f);
+  try {
+    const data = await api("/api/dataset", { method: "POST", body: fd });
+    renderAnchors(data.anchors);
+    $("resultBox").innerHTML = '<p class="muted">新账已建立，请登记锚点后核查。</p>';
+    banner("ok", data.message);
+    await refresh();
+  } catch (e) { banner("bad", e.message); }
+});
+
+$("addAnchorBtn").addEventListener("click", async () => {
+  const event_no = parseInt($("anchorEvent").value, 10);
+  const utc_ms = parseInt($("anchorUtc").value, 10);
+  try {
+    const data = await api("/api/anchors", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ event_no, utc_ms })
+    });
+    renderAnchors(data.anchors);
+    $("anchorEvent").value = ""; $("anchorUtc").value = "";
+    clearBanner();
+  } catch (e) { banner("bad", e.message); }
+});
+
+$("verifyBtn").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/verify", { method: "POST" });
+    renderResult(data.result);
+    clearBanner();
+  } catch (e) { banner("bad", e.message); }
+});
+
+refresh();
+</script>
+</body>
+</html>
